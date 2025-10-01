@@ -15,6 +15,7 @@ export interface Env {
 	// Variables defined in the "Environment Variables" section of the Wrangler CLI or dashboard
 	USERNAME: string;
 	PASSWORD: string;
+	USER_SERVICE_URL?: string;
 }
 
 async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
@@ -75,14 +76,20 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-function make_resource_path(request: Request): string {
+function make_resource_path(request: Request, username?: string): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
+
+	// If username is provided, prepend it to the path for user isolation
+	if (username) {
+		path = path ? `${username}/${path}` : username;
+	}
+
 	return path;
 }
 
-async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
-	let response = await handle_get(request, bucket);
+async function handle_head(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let response = await handle_get(request, bucket, username);
 	return new Response(null, {
 		status: response.status,
 		statusText: response.statusText,
@@ -90,8 +97,8 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 	});
 }
 
-async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+async function handle_get(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let resource_path = make_resource_path(request, username);
 
 	if (request.url.endsWith('/')) {
 		let page = '',
@@ -105,7 +112,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			if (object.key === resource_path) {
 				continue;
 			}
-			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+			let href = `/${object.key.slice(username ? username.length + 1 : 0) + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length)}</a><br>`;
 		}
 		// 定义模板
@@ -140,28 +147,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 					...{ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` },
 					...(object.httpMetadata?.contentDisposition
 						? {
-							'Content-Disposition': object.httpMetadata.contentDisposition,
-						}
+								'Content-Disposition': object.httpMetadata.contentDisposition,
+							}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-							'Content-Encoding': object.httpMetadata.contentEncoding,
-						}
+								'Content-Encoding': object.httpMetadata.contentEncoding,
+							}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-							'Content-Language': object.httpMetadata.contentLanguage,
-						}
+								'Content-Language': object.httpMetadata.contentLanguage,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-							'Cache-Control': object.httpMetadata.cacheControl,
-						}
+								'Cache-Control': object.httpMetadata.cacheControl,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-						}
+								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+							}
 						: {}),
 				},
 			});
@@ -187,12 +194,12 @@ function calcContentRange(object: R2ObjectBody) {
 	return { rangeOffset, rangeEnd };
 }
 
-async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_put(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
 	if (request.url.endsWith('/')) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request, username);
 
 	// Check if the parent directory exists
 	let dirpath = resource_path.split('/').slice(0, -1).join('/');
@@ -211,25 +218,12 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	return new Response('', { status: 201 });
 }
 
-async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+async function handle_delete(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let resource_path = make_resource_path(request, username);
 
-	if (resource_path === '') {
-		let r2_objects,
-			cursor: string | undefined = undefined;
-		do {
-			r2_objects = await bucket.list({ cursor: cursor });
-			let keys = r2_objects.objects.map((object) => object.key);
-			if (keys.length > 0) {
-				await bucket.delete(keys);
-			}
-
-			if (r2_objects.truncated) {
-				cursor = r2_objects.cursor;
-			}
-		} while (r2_objects.truncated);
-
-		return new Response(null, { status: 204 });
+	if (resource_path === '' || (username && resource_path === username)) {
+		// Don't allow deleting the root or user's root folder
+		return new Response('Forbidden', { status: 403 });
 	}
 
 	let resource = await bucket.head(resource_path);
@@ -261,14 +255,14 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	return new Response(null, { status: 204 });
 }
 
-async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_mkcol(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
 	// Stupid Windows Explorer carries the body, we have to support it.
 	// So dont check for request.body.
 	// if (request.body) {
 	// 	return new Response('Unsupported Media Type', { status: 415 });
 	// }
 
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request, username);
 
 	// Check if the resource already exists
 	let resource = await bucket.head(resource_path);
@@ -290,7 +284,7 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
-function generate_propfind_response(object: R2Object | null): string {
+function generate_propfind_response(object: R2Object | null, username?: string): string {
 	if (object === null) {
 		return `
 	<response>
@@ -307,31 +301,34 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+	// Strip username prefix from href for user isolation
+	let displayKey =
+		username && object.key.startsWith(username + '/') ? object.key.slice(username.length + 1) : object.key;
+	let href = `/${displayKey + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 	return `
 	<response>
 		<href>${href}</href>
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-			.filter(([_, value]) => value !== undefined)
-			.map(([key, value]) => `<${key}>${value}</${key}>`)
-			.join('\n				')}
+				.filter(([_, value]) => value !== undefined)
+				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
 }
 
-async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+async function handle_propfind(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let resource_path = make_resource_path(request, username);
 
 	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-	if (resource_path === '') {
-		page += generate_propfind_response(null);
+	if (resource_path === '' || (username && resource_path === username)) {
+		page += generate_propfind_response(null, username);
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -339,7 +336,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			return new Response('Not Found', { status: 404 });
 		}
 		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		page += generate_propfind_response(object);
+		page += generate_propfind_response(object, username);
 	}
 
 	if (is_collection) {
@@ -349,17 +346,19 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				break;
 			case '1':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resource_path === '' || resource_path === username ? resource_path : resource_path + '/';
+					if (prefix && !prefix.endsWith('/')) prefix += '/';
 					for await (let object of listAll(bucket, prefix)) {
-						page += generate_propfind_response(object);
+						page += generate_propfind_response(object, username);
 					}
 				}
 				break;
 			case 'infinity':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resource_path === '' || resource_path === username ? resource_path : resource_path + '/';
+					if (prefix && !prefix.endsWith('/')) prefix += '/';
 					for await (let object of listAll(bucket, prefix, true)) {
-						page += generate_propfind_response(object);
+						page += generate_propfind_response(object, username);
 					}
 				}
 				break;
@@ -378,8 +377,8 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	});
 }
 
-async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
-	const resource_path = make_resource_path(request);
+async function handle_proppatch(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	const resource_path = make_resource_path(request, username);
 
 	// 检查资源是否存在
 	let object = await bucket.head(resource_path);
@@ -456,13 +455,17 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		customMetadata: customMetadata,
 	});
 
+	// Strip username prefix from response href
+	let displayKey =
+		username && object.key.startsWith(username + '/') ? object.key.slice(username.length + 1) : object.key;
+
 	// 构造响应
 	let responseXML = '<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n';
 
 	for (const propName in setProperties) {
 		responseXML += `
     <response>
-        <href>/${object.key}</href>
+        <href>/${displayKey}</href>
         <propstat>
             <prop>
                 <${propName} />
@@ -475,7 +478,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	for (const propName of removeProperties) {
 		responseXML += `
     <response>
-        <href>/${object.key}</href>
+        <href>/${displayKey}</href>
         <propstat>
             <prop>
                 <${propName} />
@@ -495,15 +498,20 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	});
 }
 
-async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+async function handle_copy(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let resource_path = make_resource_path(request, username);
 	let dont_overwrite = request.headers.get('Overwrite') === 'F';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
+
+	// Parse and apply user isolation to destination
 	let destination = new URL(destination_header).pathname.slice(1);
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	if (username) {
+		destination = destination ? `${username}/${destination}` : username;
+	}
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -590,15 +598,20 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+async function handle_move(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
+	let resource_path = make_resource_path(request, username);
 	let overwrite = request.headers.get('Overwrite') === 'T';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
+
+	// Parse and apply user isolation to destination
 	let destination = new URL(destination_header).pathname.slice(1);
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	if (username) {
+		destination = destination ? `${username}/${destination}` : username;
+	}
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -624,8 +637,9 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	if (destination_exists) {
-		// Delete the destination first
-		await handle_delete(new Request(new URL(destination_header), request), bucket);
+		// Delete the destination first - create a new request with user-aware path
+		let destRequest = new Request(request.url, request);
+		await handle_delete(destRequest, bucket, username);
 	}
 
 	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
@@ -699,7 +713,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 const DAV_CLASS = '1, 3';
 const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE'];
 
-async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
+async function dispatch_handler(request: Request, bucket: R2Bucket, username?: string): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
@@ -711,31 +725,31 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 			});
 		}
 		case 'HEAD': {
-			return await handle_head(request, bucket);
+			return await handle_head(request, bucket, username);
 		}
 		case 'GET': {
-			return await handle_get(request, bucket);
+			return await handle_get(request, bucket, username);
 		}
 		case 'PUT': {
-			return await handle_put(request, bucket);
+			return await handle_put(request, bucket, username);
 		}
 		case 'DELETE': {
-			return await handle_delete(request, bucket);
+			return await handle_delete(request, bucket, username);
 		}
 		case 'MKCOL': {
-			return await handle_mkcol(request, bucket);
+			return await handle_mkcol(request, bucket, username);
 		}
 		case 'PROPFIND': {
-			return await handle_propfind(request, bucket);
+			return await handle_propfind(request, bucket, username);
 		}
 		case 'PROPPATCH': {
-			return await handle_proppatch(request, bucket);
+			return await handle_proppatch(request, bucket, username);
 		}
 		case 'COPY': {
-			return await handle_copy(request, bucket);
+			return await handle_copy(request, bucket, username);
 		}
 		case 'MOVE': {
-			return await handle_move(request, bucket);
+			return await handle_move(request, bucket, username);
 		}
 		default: {
 			return new Response('Method Not Allowed', {
@@ -750,31 +764,88 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 function is_authorized(authorization_header: string, username: string, password: string): boolean {
-    const encoder = new TextEncoder();
+	const encoder = new TextEncoder();
 
-    const header = encoder.encode(authorization_header);
-    const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	const header = encoder.encode(authorization_header);
+	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
 
-    return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+	return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+}
+
+async function verify_user_service(authorization_header: string, userServiceUrl: string): Promise<string | null> {
+	try {
+		// Parse Basic auth header to extract username and password
+		if (!authorization_header.startsWith('Basic ')) {
+			return null;
+		}
+
+		const base64Credentials = authorization_header.slice(6);
+		const credentials = atob(base64Credentials);
+		const [username, password] = credentials.split(':', 2);
+
+		if (!username || !password) {
+			return null;
+		}
+
+		// Call user-service to verify credentials
+		const response = await fetch(userServiceUrl, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({ username, password }),
+		});
+
+		if (response.ok) {
+			const data = (await response.json()) as { success?: boolean; username?: string };
+			if (data.success && data.username) {
+				return data.username;
+			}
+		}
+
+		return null;
+	} catch (error) {
+		console.error('Error verifying with user-service:', error);
+		return null;
+	}
 }
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
 
-		if (
-			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
-		) {
-			return new Response('Unauthorized', {
-				status: 401,
-				headers: {
-					'WWW-Authenticate': 'Basic realm="webdav"',
-				},
-			});
+		let username: string | undefined;
+
+		if (request.method !== 'OPTIONS') {
+			const authHeader = request.headers.get('Authorization') ?? '';
+
+			// Try user-service authentication first if URL is configured
+			if (env.USER_SERVICE_URL) {
+				const verifiedUsername = await verify_user_service(authHeader, env.USER_SERVICE_URL);
+				if (verifiedUsername) {
+					username = verifiedUsername;
+				} else {
+					return new Response('Unauthorized', {
+						status: 401,
+						headers: {
+							'WWW-Authenticate': 'Basic realm="webdav"',
+						},
+					});
+				}
+			} else {
+				// Fall back to basic authentication
+				if (!is_authorized(authHeader, env.USERNAME, env.PASSWORD)) {
+					return new Response('Unauthorized', {
+						status: 401,
+						headers: {
+							'WWW-Authenticate': 'Basic realm="webdav"',
+						},
+					});
+				}
+			}
 		}
 
-		let response: Response = await dispatch_handler(request, bucket);
+		let response: Response = await dispatch_handler(request, bucket, username);
 
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
