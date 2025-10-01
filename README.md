@@ -4,6 +4,12 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
+## Features
+
+- **WebDAV Interface**: Full WebDAV support for R2 storage
+- **User Isolation**: Optional user-specific folder isolation when using user-service authentication
+- **Flexible Authentication**: Supports both basic authentication and external user-service authentication
+
 ## Usage
 
 Change wrangler.toml to your own.
@@ -14,7 +20,9 @@ binding = 'bucket' # <~ valid JavaScript variable name, don't change this
 bucket_name = 'webdav'
 ```
 
-Then use wrangler to deploy.
+### Basic Authentication
+
+For simple username/password authentication:
 
 ```bash
 wrangler deploy
@@ -22,6 +30,37 @@ wrangler deploy
 wrangler secret put USERNAME
 wrangler secret put PASSWORD
 ```
+
+### User-Service Authentication
+
+For integration with an external user authentication service:
+
+```bash
+wrangler deploy
+
+# Set the user-service URL
+wrangler secret put USER_SERVICE_URL
+```
+
+The user-service should accept POST requests with JSON body:
+
+```json
+{
+	"username": "user",
+	"password": "pass"
+}
+```
+
+And respond with:
+
+```json
+{
+	"success": true,
+	"username": "verified_username"
+}
+```
+
+When using user-service authentication, each user will only have access to their own folder (prefixed with their username) in the R2 bucket, providing automatic user isolation.
 
 ## Development
 
